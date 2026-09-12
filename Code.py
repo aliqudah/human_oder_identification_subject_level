@@ -12,7 +12,8 @@ from scipy.signal import find_peaks, peak_widths
 # Modeling
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import (accuracy_score, precision_recall_fscore_support,
-                             roc_auc_score, confusion_matrix, roc_curve, auc)
+                             roc_auc_score, confusion_matrix, roc_curve, auc,
+                             average_precision_score, precision_recall_curve)
 from sklearn.model_selection import StratifiedKFold
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier
 from sklearn.svm import SVC
@@ -195,32 +196,25 @@ def load_raw_voc_signals(data_directory="VOC Raw Data2/"):
 # ------------------------------
 def extract_features_from_signal(retention_times, intensities, target_features=80):
     features = {}
-    # Basic guard
     if retention_times is None or len(retention_times) == 0 or intensities is None or len(intensities) == 0:
         for i in range(target_features):
             features[f'f_{i}'] = 0.0
         return features
 
-    # sort by RT
     order = np.argsort(retention_times)
     rt = np.array(retention_times)[order].astype(float)
     it = np.array(intensities)[order].astype(float)
     
-    # smoothing for peak detection
     if len(it) > 3:
         it_smooth = gaussian_filter1d(it, sigma=max(0.5, len(it) / 50.0))
     else:
         it_smooth = it.copy()
         
-    # find peaks: adapt prominence relative to dynamic range
     prominence = max(1e-6, 0.06 * (np.max(it_smooth) - np.min(it_smooth)))
     peaks, props = find_peaks(it_smooth, prominence=prominence, distance=2)
-    
-    # widths (rel_height=0.5)
     widths_res = peak_widths(it_smooth, peaks, rel_height=0.5) if peaks.size > 0 else (np.array([]),)
     widths = widths_res[0] if len(widths_res) > 0 else np.array([])
 
-    # fundamental statistics
     if len(rt) > 1:
         try:
             features['total_area'] = float(np.trapezoid(it, rt)) # NumPy 2.0+
@@ -241,7 +235,6 @@ def extract_features_from_signal(retention_times, intensities, target_features=8
     features['width_std'] = float(np.std(widths)) if widths.size > 0 else 0.0
     features['peak_prominence_mean'] = float(np.mean(props['prominences'])) if (peaks.size > 0 and 'prominences' in props) else 0.0
 
-    # top-5 peaks (by intensity)
     if peaks.size > 0:
         top_idx = np.argsort(it_smooth[peaks])[-5:][::-1]
     else:
@@ -258,12 +251,10 @@ def extract_features_from_signal(retention_times, intensities, target_features=8
             features[f'top{i+1}_rt'] = 0.0
             features[f'top{i+1}_width'] = 0.0
 
-    # additional engineered features
     features['peak_density'] = float(len(peaks) / (rt.max() - rt.min() + 1e-8)) if len(rt) > 1 else 0.0
     features['intensity_skew'] = float(pd.Series(it).skew()) if len(it) > 2 else 0.0
     features['intensity_kurtosis'] = float(pd.Series(it).kurtosis()) if len(it) > 2 else 0.0
 
-    # pad or trim to target_features
     ordered = list(features.items())
     idx = 0
     while len(ordered) < target_features:
@@ -272,6 +263,7 @@ def extract_features_from_signal(retention_times, intensities, target_features=8
     ordered = ordered[:target_features]
     
     return {k: float(v) for k, v in ordered}
+
 # ------------------------------
 # NEW: Create RAW dataset (NO augmentation) for baseline comparison
 # ------------------------------
@@ -421,8 +413,8 @@ def get_signal_augmented_classifiers():
         'AdaBoost': AdaBoostClassifier(n_estimators=200, random_state=42, learning_rate=0.5),
         'Decision Tree': DecisionTreeClassifier(random_state=42, max_depth=20),
         'Naive Bayes': GaussianNB(),
-        'Linear Discriminant Analysis': LinearDiscriminantAnalysis(),
-        'Quadratic Discriminant Analysis': QuadraticDiscriminantAnalysis(),
+        'Linear Discriminant Analysis': LinearDiscriminantAnalysis(solver='eigen', shrinkage='auto'),
+        'Quadratic Discriminant Analysis': QuadraticDiscriminantAnalysis(reg_param=1e-3),
         'Deep Learning (Neural Network)': 'neural_network'
     }
     return classifiers
@@ -463,7 +455,6 @@ def calculate_metrics_signal_augmented(y_true, y_pred, y_proba, label_encoder):
     try:
         if y_proba is not None and y_proba.shape[1] == num_classes and len(np.unique(y_true)) > 1:
             y_true_cat = to_categorical(y_true, num_classes=num_classes)
-            # REVIEWER REQUEST: Verified robust Macro-AUC (One-vs-Rest) calculation
             auc_score = roc_auc_score(y_true_cat, y_proba, average='macro', multi_class='ovr')
             metrics['macro_auc'] = float(auc_score)
         else:
@@ -511,6 +502,9 @@ def evaluate_signal_augmented_classifiers(X, y, y_cat, label_encoder, feature_na
                     y_pred = clf.predict(X_val)
                     try:
                         y_pred_proba = clf.predict_proba(X_val)
+                        y_pred_proba = np.asarray(y_pred_proba)
+                        if y_pred_proba.ndim == 1:
+                            y_pred_proba = y_pred_proba.reshape(-1, 1)
                         if y_pred_proba.shape[1] != len(label_encoder.classes_):
                             classes_in_fold = clf.classes_ if hasattr(clf, 'classes_') else np.unique(y_tr)
                             global_indices = label_encoder.transform(classes_in_fold)
@@ -532,7 +526,7 @@ def evaluate_signal_augmented_classifiers(X, y, y_cat, label_encoder, feature_na
                         
                 clf_aggregation_data[clf_name]['y_true'] = np.concatenate([clf_aggregation_data[clf_name]['y_true'], y_val])
                 clf_aggregation_data[clf_name]['y_pred'] = np.concatenate([clf_aggregation_data[clf_name]['y_pred'], y_pred])
-                if y_pred_proba is not None:
+                if y_pred_proba is not None and y_pred_proba.ndim == 2 and y_pred_proba.shape[1] == len(label_encoder.classes_):
                     clf_aggregation_data[clf_name]['y_proba'] = np.concatenate([clf_aggregation_data[clf_name]['y_proba'], y_pred_proba], axis=0)
             except Exception as e:
                 print(f"  {clf_name} fold {fold_idx} error: {e}")
@@ -661,7 +655,7 @@ def plot_feature_engineering_summary(output_dir):
     ax.text(0, 1, text, ha='left', va='top', fontsize=12, wrap=True)
     plt.title("Figure 1. Feature Engineering Overview (Peak-Based)", fontsize=14, loc='center', pad=20)
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "Figure1_Feature_Engineering_Summary.png"))
+    plt.savefig(os.path.join(output_dir, "Figure1_Feature_Engineering_Summary.png"), dpi=300)
     plt.close(fig)
 
 # MODIFIED: Top K Feature Importance
@@ -674,7 +668,6 @@ def plot_feature_importance(feature_names, importances, title="Feature Importanc
         return
         
     sorted_idx = np.argsort(importances)[::-1]
-    # REVIEWER REQUEST: Show only Top K features
     top_n = min(top_k, len(importances))
     plot_importances = importances[sorted_idx][:top_n]
     plot_features = np.array(feature_names)[sorted_idx][:top_n]
@@ -702,7 +695,7 @@ def plot_classifier_comparison(results_df, output_dir=OUTPUT_DIR):
     plt.legend(title="Metric", loc='lower right')
     plt.tight_layout()
     plt.title("Figure 3. Classifier Comparison (Mean Metrics over CV Folds)", fontsize=16)
-    plt.savefig(os.path.join(output_dir, "Figure3_Classifier_Comparison.png"))
+    plt.savefig(os.path.join(output_dir, "Figure3_Classifier_Comparison.png"), dpi=300)
     plt.close(fig)
 
 def plot_best_clf_detailed_metrics(clf_metrics, clf_name, output_dir=OUTPUT_DIR):
@@ -725,27 +718,29 @@ def plot_best_clf_detailed_metrics(clf_metrics, clf_name, output_dir=OUTPUT_DIR)
     plt.ylim(0, 1.05)
     plt.title(f"Figure 4. {clf_name} – Detailed Mean Performance (Over CV Folds)", fontsize=16)
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"Figure4_{clf_name}_Detailed_Metrics.png"))
+    plt.savefig(os.path.join(output_dir, f"Figure4_{clf_name}_Detailed_Metrics.png"), dpi=300)
     plt.close(fig)
 
+# MODIFIED: Absolute Counts Confusion Matrix
 def plot_average_confusion_matrix(y_true, y_pred, label_encoder, clf_name, output_dir=OUTPUT_DIR):
     if y_true.size == 0 or y_true.size != y_pred.size:
         print(f"Skipping Confusion Matrix for {clf_name}: Inconsistent or empty aggregated data.")
         return
+    # Use absolute counts instead of normalized ratios
     cm = confusion_matrix(y_true, y_pred, labels=np.arange(len(label_encoder.classes_)))
-    row_sums = cm.sum(axis=1)[:, np.newaxis] 
-    cm_normalized = np.divide(cm.astype('float'), row_sums, out=np.zeros_like(cm, dtype=float), where=row_sums!=0)
+    
     fig, ax = plt.subplots(figsize=(10, 8))
-    sns.heatmap(cm_normalized, annot=True, fmt=".2f", cmap="Blues",
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
                 xticklabels=label_encoder.classes_, yticklabels=label_encoder.classes_,
                 cbar=True, square=True, linewidths=0.5, linecolor='gray')
     plt.ylabel("True Subject", fontsize=12)
     plt.xlabel("Predicted Subject", fontsize=12)
-    plt.title(f"Figure 5. Aggregated Confusion Matrix - {clf_name}", fontsize=16)
+    plt.title(f"Figure 5. Aggregated Confusion Matrix (Counts) - {clf_name}", fontsize=16)
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"Figure5_{clf_name}_Confusion_Matrix.png"))
+    plt.savefig(os.path.join(output_dir, f"Figure5_{clf_name}_Confusion_Matrix.png"), dpi=300)
     plt.close(fig)
 
+# ROC Curves
 def plot_average_roc(y_true, y_proba, label_encoder, clf_name, output_dir=OUTPUT_DIR):
     if y_true.size == 0 or y_proba.shape[0] == 0:
         print(f"Skipping ROC plot for {clf_name}: empty y_true or y_proba.")
@@ -780,7 +775,48 @@ def plot_average_roc(y_true, y_proba, label_encoder, clf_name, output_dir=OUTPUT
     plt.title(f"Figure 6. Aggregated ROC Curves - {clf_name}", fontsize=16)
     plt.legend(loc="lower right")  
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"Figure6_{clf_name}_ROC.png"))
+    plt.savefig(os.path.join(output_dir, f"Figure6_{clf_name}_ROC.png"), dpi=300)
+    plt.close()
+
+# NEW: Precision-Recall Curves
+def plot_average_prc(y_true, y_proba, label_encoder, clf_name, output_dir=OUTPUT_DIR):
+    if y_true.size == 0 or y_proba.shape[0] == 0:
+        print(f"Skipping PRC plot for {clf_name}: empty y_true or y_proba.")
+        return
+    n_classes = len(label_encoder.classes_)
+    y_true_cat = to_categorical(y_true, num_classes=n_classes)
+    plt.figure(figsize=(10, 8))
+    
+    precision = dict()
+    recall = dict()
+    average_precision = dict()
+    has_valid_curve = False
+    
+    for i in range(n_classes):
+        if np.sum(y_true == i) > 0:
+            precision[i], recall[i], _ = precision_recall_curve(y_true_cat[:, i], y_proba[:, i])
+            average_precision[i] = average_precision_score(y_true_cat[:, i], y_proba[:, i])
+            plt.plot(recall[i], precision[i], lw=2, label=f"{label_encoder.classes_[i]} (AP = {average_precision[i]:.2f})")
+            has_valid_curve = True
+            
+    if not has_valid_curve:
+        print(f"Skipping PRC plot for {clf_name}: Not enough variability in aggregated data to compute curves.")
+        plt.close()
+        return
+        
+    # Micro-average
+    precision["micro"], recall["micro"], _ = precision_recall_curve(y_true_cat.ravel(), y_proba.ravel())
+    average_precision["micro"] = average_precision_score(y_true_cat, y_proba, average="micro")
+    plt.plot(recall["micro"], precision["micro"], color='black', lw=2, linestyle='--', label=f"micro-average (AP = {average_precision['micro']:.2f})")
+    
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('Recall', fontsize=12)
+    plt.ylabel('Precision', fontsize=12)
+    plt.title(f"Figure 7. Aggregated Precision-Recall Curves - {clf_name}", fontsize=16)
+    plt.legend(loc="lower left")  
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"Figure7_{clf_name}_PRC.png"), dpi=300)
     plt.close()
 
 def plot_radar_chart(metrics_dict, output_dir=OUTPUT_DIR):
@@ -806,16 +842,17 @@ def plot_radar_chart(metrics_dict, output_dir=OUTPUT_DIR):
     ax.set_yticks(np.arange(0.2, 1.0, 0.2)) 
     ax.set_yticklabels([f"{y:.1f}" for y in np.arange(0.2, 1.0, 0.2)], color="gray", size=10)
     ax.set_ylim(0, 1.0)
-    plt.title("Figure 7. Performance Comparison – Radar Chart (Mean Metrics)", size=16, y=1.1)
+    plt.title("Figure 8. Performance Comparison – Radar Chart (Mean Metrics)", size=16, y=1.1)
     ax.legend(loc="upper right", bbox_to_anchor=(0.1, 0.1))
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "Figure7_Radar_Chart.png"))
+    plt.savefig(os.path.join(output_dir, "Figure8_Radar_Chart.png"), dpi=300)
     plt.close(fig)
 
 # ------------------------------
 # Main
 # ------------------------------
 def main():
+    
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
     print(f"Created output directory: {OUTPUT_DIR}/")
@@ -827,7 +864,8 @@ def main():
         
     TARGET_FEATURES = 80
     AUG_FACTOR = 5
-    
+   
+
     # ---------------------------------------------------------
     # STEP 1: BASELINE EVALUATION (RAW DATA) - Reviewer Request
     # ---------------------------------------------------------
@@ -881,8 +919,11 @@ def main():
     plot_feature_importance(feat_cols, catboost_importances, "CatBoost Feature Importance", output_dir=OUTPUT_DIR, top_k=TOP_K_FEATURES)
     plot_classifier_comparison(results_df, output_dir=OUTPUT_DIR)
     plot_best_clf_detailed_metrics(results_aug[best_clf_name], best_clf_name, output_dir=OUTPUT_DIR)
+    
+    # Updated plotting sequence with Counts Confusion Matrix, ROC, and new PRC
     plot_average_confusion_matrix(best_y_true, best_y_pred, label_encoder, best_clf_name, output_dir=OUTPUT_DIR)
     plot_average_roc(best_y_true, best_y_proba, label_encoder, best_clf_name, output_dir=OUTPUT_DIR)
+    plot_average_prc(best_y_true, best_y_proba, label_encoder, best_clf_name, output_dir=OUTPUT_DIR)
     plot_radar_chart(radar_metrics, output_dir=OUTPUT_DIR)
     
     print(f"\nAll done. Results, comparison tables, and figures saved to: {OUTPUT_DIR}/")
