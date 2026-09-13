@@ -70,7 +70,9 @@ This specific codebase (`subject_code4.py`) has been explicitly updated to addre
 
 ## 📂 Repository Structure
 ```text
-├── code.py          # Main execution script (End-to-End pipeline)
+├── Subject_Code.py          # Main Subject execution script (End-to-End pipeline)
+├── Sample_Code.py          # Main Sample execution script (End-to-End pipeline)
+├── analyze_voc_data.py         # Data Analysis Code execution script (End-to-End pipeline)
 ├── VOC Raw Data2/            # Directory containing raw GC/MS .TXT files
 │   ├── Subject01/
 │   │   ├── A1.TXT            # Arm/Funnel sample
